@@ -37,8 +37,8 @@ import (
 
 var (
 	ifName  = "^e.*"
-	noLoad  = flag.Bool("no-load", false, "get DHCP response, but don't load the kernel")
-	dryRun  = flag.Bool("dry-run", false, "download kernel, but don't kexec it")
+	noLoad  = flag.Bool("no-load", false, "get DHCP response, print chosen boot configuration, but do not download + exec it")
+	noExec  = flag.Bool("no-exec", false, "download boot configuration, but do not exec it")
 	verbose = flag.Bool("v", false, "Verbose output")
 )
 
@@ -105,7 +105,6 @@ func main() {
 	if len(flag.Args()) > 1 {
 		log.Fatalf("Only one regexp-style argument is allowed, e.g.: " + ifName)
 	}
-
 	if len(flag.Args()) > 0 {
 		ifName = flag.Args()[0]
 	}
@@ -123,13 +122,23 @@ func main() {
 		}
 		return
 	}
-	menuEntries := menu.OSImages(*dryRun, images...)
+	menuEntries := menu.OSImages(*verbose, images...)
 	menuEntries = append(menuEntries, menu.Reboot{})
 	menuEntries = append(menuEntries, menu.StartShell{})
 
-	menu.ShowMenuAndBoot(os.Stdin, menuEntries...)
+	chosenEntry := menu.ShowMenuAndLoad(os.Stdin, menuEntries...)
+	if chosenEntry == nil {
+		log.Fatalf("Nothing to boot.")
+	}
+	if *noExec {
+		log.Printf("Chosen menu entry: %s", chosenEntry)
+		os.Exit(0)
+	}
+	// Exec should either return an error or not return at all.
+	if err := chosenEntry.Exec(); err != nil {
+		log.Fatalf("Failed to exec %s: %v", chosenEntry, err)
+	}
 
-	// Kexec should either return an error or not return.
+	// Kexec should either return an error or not return at all.
 	panic("unreachable")
-
 }

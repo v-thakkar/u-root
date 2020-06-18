@@ -8,13 +8,14 @@
 
 //
 // Synopsis:
-//	boot [-v][-dry-run]
+//	boot [-v][-no-load][-no-exec]
 //
 // Description:
 //	If returns to u-root shell, the code didn't found a local bootable option
 //
 //      -v prints messages
-//      -dry-run doesn't really boot
+//      -no-load prints the boot image paths it was going to load, but doesn't load + exec them
+//      -no-exec loads the boot image, but doesn't exec it
 //
 // Notes:
 //	The code is looking for boot/grub/grub.cfg file as to identify the
@@ -41,6 +42,7 @@ import (
 	"github.com/u-root/u-root/pkg/boot"
 	"github.com/u-root/u-root/pkg/boot/bls"
 	"github.com/u-root/u-root/pkg/boot/grub"
+	"github.com/u-root/u-root/pkg/boot/menu"
 	"github.com/u-root/u-root/pkg/boot/syslinux"
 	"github.com/u-root/u-root/pkg/cmdline"
 	"github.com/u-root/u-root/pkg/mount"
@@ -48,23 +50,11 @@ import (
 	"github.com/u-root/u-root/pkg/ulog"
 )
 
-const (
-	bootableMBR     = 0xaa55
-	signatureOffset = 510
-)
-
-type bootEntry struct {
-	kernel  string
-	initrd  string
-	cmdline string
-}
-
 var (
-	verbose     = flag.Bool("v", false, "Print debug messages")
-	debug       = func(string, ...interface{}) {}
-	dryRun      = flag.Bool("dry-run", false, "load kernel, but don't kexec it")
-	defaultBoot = flag.String("boot", "", "entry to boot (default to the configuration file default)")
-	list        = flag.Bool("list", false, "list found configurations")
+	debug   = func(string, ...interface{}) {}
+	verbose = flag.Bool("v", false, "Print debug messages")
+	noLoad  = flag.Bool("no-load", false, "print chosen boot configuration, but do not load + exec it")
+	noExec  = flag.Bool("no-exec", false, "load boot configuration, but do not exec it")
 
 	removeCmdlineItem = flag.String("remove", "console", "comma separated list of kernel params value to remove from parsed kernel configuration (default to console)")
 	reuseCmdlineItem  = flag.String("reuse", "console", "comma separated list of kernel params value to reuse from current kernel (default to console)")
@@ -79,15 +69,7 @@ func updateBootCmdline(cl string) string {
 	return f.Update(cl)
 }
 
-func mountAndBoot(device *block.BlockDev, mountDir string) {
-	os.MkdirAll(mountDir, 0777)
-
-	mp, err := device.Mount(mountDir, mount.ReadOnly)
-	if err != nil {
-		return
-	}
-	defer mp.Unmount(mount.MNT_DETACH)
-
+func parse(device *block.BlockDev, mountDir string) []boot.OSImage {
 	imgs, err := bls.ScanBLSEntries(ulog.Log, mountDir)
 	if err != nil {
 		log.Printf("Failed to parse systemd-boot BootLoaderSpec configs, trying another format...: %v", err)
@@ -105,44 +87,14 @@ func mountAndBoot(device *block.BlockDev, mountDir string) {
 	}
 	imgs = append(imgs, syslinuxImgs...)
 
-	if len(imgs) == 0 {
-		return
-	}
-
-	// Boot just the first image.
-	img := imgs[0]
-
-	// Make changes to the kernel command line based on our cmdline.
-	if li, ok := img.(*boot.LinuxImage); ok {
-		li.Cmdline = updateBootCmdline(li.Cmdline)
-	}
-
-	log.Printf("BootImage: %s", img)
-	if err := img.Load(*verbose); err != nil {
-		log.Printf("kexec load of %v failed: %v", img, err)
-		return
-	}
-
-	if err := mp.Unmount(mount.MNT_DETACH); err != nil {
-		log.Printf("Can't unmount %v: %v", mp, err)
-	}
-	if *dryRun {
-		return
-	}
-
-	if err := boot.Execute(); err != nil {
-		log.Printf("boot.Execute of %v failed: %v", img, err)
-	}
-
-	// kexec was successful. kexec should have taken over. What happened?
-	log.Fatalf("kexec boot returned success, but new kernel is not running...")
+	return imgs
 }
 
 // Localboot tries to boot from any local filesystem by parsing grub configuration
-func Localboot() error {
+func Localboot() ([]boot.OSImage, []*mount.MountPoint, error) {
 	blockDevs, err := block.GetBlockDevices()
 	if err != nil {
-		return errors.New("no available block devices to boot from")
+		return nil, nil, errors.New("no available block devices to boot from")
 	}
 
 	// Try to only boot from "good" block devices.
@@ -151,15 +103,25 @@ func Localboot() error {
 
 	mountPoints, err := ioutil.TempDir("", "u-root-boot")
 	if err != nil {
-		return fmt.Errorf("Can't create tmpdir: %v", err)
+		return nil, nil, fmt.Errorf("cannot create tmpdir: %v", err)
 	}
-	defer os.RemoveAll(mountPoints)
 
+	var images []boot.OSImage
+	var mps []*mount.MountPoint
 	for _, device := range blockDevs {
 		dir := filepath.Join(mountPoints, device.Name)
-		mountAndBoot(device, dir)
+
+		os.MkdirAll(dir, 0777)
+		mp, err := device.Mount(dir, mount.ReadOnly)
+		if err != nil {
+			continue
+		}
+
+		imgs := parse(device, dir)
+		images = append(images, imgs...)
+		mps = append(mps, mp)
 	}
-	return fmt.Errorf("Sorry no bootable device found")
+	return images, mps, nil
 }
 
 func main() {
@@ -169,7 +131,49 @@ func main() {
 		debug = log.Printf
 	}
 
-	if err := Localboot(); err != nil {
+	images, mps, err := Localboot()
+	if err != nil {
 		log.Fatal(err)
 	}
+	for _, img := range images {
+		// Make changes to the kernel command line based on our cmdline.
+		if li, ok := img.(*boot.LinuxImage); ok {
+			li.Cmdline = updateBootCmdline(li.Cmdline)
+		}
+	}
+
+	if *noLoad {
+		if len(images) > 0 {
+			log.Printf("Got configuration: %s", images[0])
+		} else {
+			log.Fatalf("Nothing bootable found.")
+		}
+		return
+	}
+	menuEntries := menu.OSImages(*verbose, images...)
+	menuEntries = append(menuEntries, menu.Reboot{})
+	menuEntries = append(menuEntries, menu.StartShell{})
+
+	chosenEntry := menu.ShowMenuAndLoad(os.Stdin, menuEntries...)
+
+	// Clean up.
+	for _, mp := range mps {
+		if err := mp.Unmount(mount.MNT_DETACH); err != nil {
+			debug("Failed to unmount %s: %v", mp, err)
+		}
+	}
+	if chosenEntry == nil {
+		log.Fatalf("Nothing to boot.")
+	}
+	if *noExec {
+		log.Printf("Chosen menu entry: %s", chosenEntry)
+		os.Exit(0)
+	}
+	// Exec should either return an error or not return at all.
+	if err := chosenEntry.Exec(); err != nil {
+		log.Fatalf("Failed to exec %s: %v", chosenEntry, err)
+	}
+
+	// Kexec should either return an error or not return.
+	panic("unreachable")
 }
