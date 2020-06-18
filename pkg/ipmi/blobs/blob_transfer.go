@@ -2,20 +2,19 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// OpenBMC IPMI Blob Protocol commands
+// Package blob implements OpenBMC IPMI Blob Protocol commands.
+//
 // This file declares functions that implement the generic blob transfer
 // interface detailed at https://github.com/openbmc/phosphor-ipmi-blobs
 // with IPMI as a transport layer.
 // See https://github.com/openbmc/google-ipmi-i2c for details on OEM
 // commands.
-
 package blobs
 
 import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"unsafe"
 
 	"github.com/u-root/u-root/pkg/ipmi"
 )
@@ -34,16 +33,16 @@ type BlobStats struct {
 	metadata    []uint8
 }
 
+// BlobHandler provides an interface for the blob protocol. IT can be used
+// to call all the blob transfer commands.
 type BlobHandler struct {
 	Ipmi *ipmi.IPMI
 }
 
 const (
-	IPMI_MAX_PAYLOAD_SIZE = 256
-
-	_IPMI_GGL_NET_FN   = 46
-	_IPMI_GGL_LUN      = 0
-	_IPMI_GGL_BLOB_CMD = 128
+	_IPMI_GGL_NET_FN   ipmi.NetFn   = 46
+	_IPMI_GGL_LUN                   = 0
+	_IPMI_GGL_BLOB_CMD ipmi.Command = 128
 
 	OEN_LEN = 3
 	CRC_LEN = 2
@@ -90,12 +89,14 @@ const (
 	REQ_RES_CRC CRCOption = "REQ_RES_CRC"
 )
 
-// Maps OEM names to a 3 byte OEM number.
+// OENMap maps OEM names to a 3 byte OEM number.
 // OENs are typically serialized as the first 3 bytes of a request body.
 var OENMap = map[string][3]uint8{
 	"OpenBMC": {0xcf, 0xc2, 0x00},
 }
 
+// NewBlobHandler takes an IPMI struct, which provides a reference to the IPMI
+// device driver, and returns a BlobHandler.
 func NewBlobHandler(i *ipmi.IPMI) *BlobHandler {
 	return &BlobHandler{Ipmi: i}
 }
@@ -131,14 +132,7 @@ func (h *BlobHandler) sendBmcCmd(code uint8, data []uint8, crcOpt CRCOption) ([]
 	// - (optionally) 2-byte CRC over request body in little endian format
 	// - request body in little endian format
 
-	msg := ipmi.Msg{
-		Netfn:   _IPMI_GGL_NET_FN,
-		Cmd:     _IPMI_GGL_BLOB_CMD,
-		Data:    unsafe.Pointer(&buf[0]),
-		DataLen: uint16(len(buf)),
-	}
-
-	res, err := i.SendRecv(msg)
+	res, err := i.SendRecvBasic(_IPMI_GGL_NET_FN, _IPMI_GGL_BLOB_CMD, buf)
 	if err != nil {
 		return nil, err
 	}
